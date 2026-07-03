@@ -65,9 +65,8 @@ jobs:
         id: artifacts
         run: |
           echo "Available artifacts for run ${{ steps.source.outputs.run_id }}:"
-          gh run view ${{ steps.source.outputs.run_id }} --json artifacts --jq '.artifacts[].name' || true
-          # Try to find craftkalos artifact
-          ARTIFACT_NAME=$(gh run view ${{ steps.source.outputs.run_id }} --json artifacts --jq '.artifacts[] | select(.name | startswith("craftkalos-iso-")) | .name' | head -1)
+          gh api repos/${{ github.repository }}/actions/runs/${{ steps.source.outputs.run_id }}/artifacts --jq '.artifacts[].name' || true
+          ARTIFACT_NAME=$(gh api repos/${{ github.repository }}/actions/runs/${{ steps.source.outputs.run_id }}/artifacts --jq '.artifacts[] | select(.name | startswith("craftkalos-iso-")) | .name' | head -1)
           if [ -z "$ARTIFACT_NAME" ]; then
             echo "FAIL: No craftkalos-iso-* artifact found in run ${{ steps.source.outputs.run_id }}"
             exit 1
