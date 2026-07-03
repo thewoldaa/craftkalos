@@ -1,0 +1,22 @@
+# OS output
+out/
+build/
+work/
+
+# OS files
+*.iso
+*.img
+*.qcow2
+*.vdi
+*.vmdk
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
