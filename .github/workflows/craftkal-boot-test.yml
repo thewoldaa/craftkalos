@@ -1,0 +1,296 @@
+name: CraftkalOS Boot Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run ID to test (empty = latest successful)'
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["Build CraftkalOS ISO"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  boot-test:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Determine source build run
+        id: source
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.run_id }}" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+            SHA=$(gh run view "$RUN_ID" --json headSha --jq '.headSha' 2>/dev/null || echo "")
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "Using specified run: $RUN_ID (SHA: $SHA)"
+          else
+            BRANCH="${{ github.ref_name }}"
+            echo "Searching latest successful build on branch: $BRANCH"
+            RUN_ID=$(gh run list \
+              --workflow "Build CraftkalOS ISO" \
+              --branch "$BRANCH" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+              echo "FAIL: No successful build found on branch $BRANCH"
+              exit 1
+            fi
+            SHA=$(gh run view "$RUN_ID" --json headSha --jq '.headSha')
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "Found build run $RUN_ID (SHA: $SHA)"
+          fi
+
+      - name: List available artifacts
+        id: artifacts
+        run: |
+          echo "Available artifacts for run ${{ steps.source.outputs.run_id }}:"
+          gh run view ${{ steps.source.outputs.run_id }} --json artifacts --jq '.artifacts[].name' || true
+          # Try to find craftkalos artifact
+          ARTIFACT_NAME=$(gh run view ${{ steps.source.outputs.run_id }} --json artifacts --jq '.artifacts[] | select(.name | startswith("craftkalos-iso-")) | .name' | head -1)
+          if [ -z "$ARTIFACT_NAME" ]; then
+            echo "FAIL: No craftkalos-iso-* artifact found in run ${{ steps.source.outputs.run_id }}"
+            exit 1
+          fi
+          echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "Found artifact: $ARTIFACT_NAME"
+
+      - name: Download ISO artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.artifacts.outputs.name }}
+          path: ./iso
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify ISO
+        run: |
+          ISO_FILE=$(ls iso/*.iso 2>/dev/null | head -1)
+          if [ -z "$ISO_FILE" ]; then
+            echo "FAIL: No ISO found in iso/"
+            ls -la iso/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "ISO_FILE=$ISO_FILE" >> "$GITHUB_ENV"
+          echo "ISO_NAME=$(basename "$ISO_FILE")" >> "$GITHUB_ENV"
+          echo "ISO_SIZE=$(du -h "$ISO_FILE" | cut -f1)" >> "$GITHUB_ENV"
+          echo "ISO_SHA256=$(sha256sum "$ISO_FILE" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "Downloaded: $(basename "$ISO_FILE") ($(du -h "$ISO_FILE" | cut -f1))"
+
+      - name: Install QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            qemu-system-x86 \
+            ovmf \
+            expect \
+            imagemagick
+          echo "QEMU version: $(qemu-system-x86_64 --version | head -1)"
+
+      - name: "Test Progress [1/2] — BIOS Boot Test"
+        id: bios
+        continue-on-error: true
+        run: |
+          mkdir -p output/bios
+          echo "Starting BIOS boot test (timeout: 1800s)..."
+          bash .github/scripts/qemu-boot-test.sh \
+            --iso "$ISO_FILE" \
+            --mode bios \
+            --output-dir output/bios \
+            --timeout 1800 2>&1 | tee output/bios/test-summary.txt
+          exit "${PIPESTATUS[0]}"
+
+      - name: "Test Progress [2/2] — UEFI Boot Test"
+        id: uefi
+        continue-on-error: true
+        run: |
+          mkdir -p output/uefi
+          echo "Starting UEFI boot test (timeout: 1800s)..."
+          bash .github/scripts/qemu-boot-test.sh \
+            --iso "$ISO_FILE" \
+            --mode uefi \
+            --output-dir output/uefi \
+            --timeout 1800 2>&1 | tee output/uefi/test-summary.txt
+          exit "${PIPESTATUS[0]}"
+
+      - name: Generate Boot Test Report
+        id: report
+        if: always()
+        run: |
+          BIOS_RESULT="FAIL"
+          UEFI_RESULT="FAIL"
+          BIOS_BOOT_DETECTED="N/A"
+          UEFI_BOOT_DETECTED="N/A"
+          BIOS_ELAPSED="N/A"
+          UEFI_ELAPSED="N/A"
+          BIOS_SCREENSHOTS=0
+          UEFI_SCREENSHOTS=0
+          BIOS_KVM="N/A"
+          UEFI_KVM="N/A"
+
+          BIOS_SUMMARY="output/bios/test-summary.txt"
+          if [ -f "$BIOS_SUMMARY" ]; then
+            BIOS_RESULT=$(grep -E '^RESULT=' "$BIOS_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            BIOS_BOOT_DETECTED=$(grep -E '^BOOT_DETECTED=' "$BIOS_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            BIOS_ELAPSED=$(grep -E '^ELAPSED=' "$BIOS_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            BIOS_KVM=$(grep -E '^KVM_ACCEL=' "$BIOS_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            BIOS_SCREENSHOTS=$(ls output/bios/boot-*.png 2>/dev/null | wc -l)
+            BIOS_RESULT="${BIOS_RESULT:-FAIL}"
+            BIOS_BOOT_DETECTED="${BIOS_BOOT_DETECTED:-N/A}"
+            BIOS_ELAPSED="${BIOS_ELAPSED:-N/A}"
+            BIOS_KVM="${BIOS_KVM:-N/A}"
+          fi
+
+          UEFI_SUMMARY="output/uefi/test-summary.txt"
+          if [ -f "$UEFI_SUMMARY" ]; then
+            UEFI_RESULT=$(grep -E '^RESULT=' "$UEFI_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            UEFI_BOOT_DETECTED=$(grep -E '^BOOT_DETECTED=' "$UEFI_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            UEFI_ELAPSED=$(grep -E '^ELAPSED=' "$UEFI_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            UEFI_KVM=$(grep -E '^KVM_ACCEL=' "$UEFI_SUMMARY" 2>/dev/null | head -1 | cut -d= -f2)
+            UEFI_SCREENSHOTS=$(ls output/uefi/boot-*.png 2>/dev/null | wc -l)
+            UEFI_RESULT="${UEFI_RESULT:-FAIL}"
+            UEFI_BOOT_DETECTED="${UEFI_BOOT_DETECTED:-N/A}"
+            UEFI_ELAPSED="${UEFI_ELAPSED:-N/A}"
+            UEFI_KVM="${UEFI_KVM:-N/A}"
+          fi
+
+          ISO_SAFE="YES"
+          INSTALL_RISK="None — all boot tests passed"
+          if [ "$BIOS_RESULT" != "pass" ] && [ "$BIOS_RESULT" != "intermediate" ]; then
+            ISO_SAFE="CAUTION"
+            INSTALL_RISK="BIOS boot test did not reach login. May not boot on BIOS systems."
+          fi
+          if [ "$UEFI_RESULT" != "pass" ] && [ "$UEFI_RESULT" != "intermediate" ]; then
+            if [ "$ISO_SAFE" = "CAUTION" ]; then
+              ISO_SAFE="NO"
+              INSTALL_RISK="Both BIOS and UEFI boot tests failed. ISO may be broken."
+            else
+              ISO_SAFE="CAUTION"
+              INSTALL_RISK="UEFI boot test did not reach login. May not boot on UEFI systems."
+            fi
+          fi
+          if [ "$BIOS_RESULT" = "pass" ] && [ "$UEFI_RESULT" = "pass" ]; then
+            ISO_SAFE="YES"
+            INSTALL_RISK="None — full login reached in both BIOS and UEFI"
+          fi
+
+          cat > BOOT_TEST_REPORT.md << REPORTEOF
+          # CraftkalOS — Boot Test Report
+
+          ## Test Summary
+
+          | Check | Status |
+          |-------|--------|
+          | ✅ ISO | ${{ env.ISO_NAME }} (${{ env.ISO_SIZE }}) |
+          | 🔄 BIOS Boot | ${BIOS_RESULT} |
+          | 🔄 UEFI Boot | ${UEFI_RESULT} |
+
+          ## Detailed Results
+
+          | Field | BIOS | UEFI |
+          |-------|------|------|
+          | Result | ${BIOS_RESULT} | ${UEFI_RESULT} |
+          | Boot Detected | ${BIOS_BOOT_DETECTED} | ${UEFI_BOOT_DETECTED} |
+          | Elapsed | ${BIOS_ELAPSED}s | ${UEFI_ELAPSED}s |
+          | Acceleration | ${BIOS_KVM} | ${UEFI_KVM} |
+          | Screenshots | ${BIOS_SCREENSHOTS} | ${UEFI_SCREENSHOTS} |
+
+          ## Safety Check
+
+          | Question | Answer |
+          |----------|--------|
+          | Safe to install? | **${ISO_SAFE}** |
+          | Risk assessment | ${INSTALL_RISK} |
+          | ISO SHA256 | \`${{ env.ISO_SHA256 }}\` |
+
+          ## Screenshots
+
+          Screenshots and serial logs are included in the artifact.
+
+          ---
+          *Generated by CraftkalOS Boot Validation workflow*
+          REPORTEOF
+
+          echo "BOOT_TEST_REPORT written"
+          cat BOOT_TEST_REPORT.md
+
+          echo "ISO_SAFE=$ISO_SAFE" >> "$GITHUB_ENV"
+          echo "INSTALL_RISK=$INSTALL_RISK" >> "$GITHUB_ENV"
+
+      - name: Upload Boot Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: craftkalos-boot-test-${{ steps.source.outputs.sha }}
+          path: |
+            output/**/*
+            BOOT_TEST_REPORT.md
+          if-no-files-found: warn
+
+      - name: Generate Step Summary
+        if: always()
+        run: |
+          BIOS_STATUS="❌ FAIL"
+          UEFI_STATUS="❌ FAIL"
+          if [ -f "output/bios/test-summary.txt" ]; then
+            BIOS_RES=$(grep -E '^RESULT=' output/bios/test-summary.txt 2>/dev/null | cut -d= -f2)
+            if [ "$BIOS_RES" = "pass" ]; then BIOS_STATUS="✅ PASS"; fi
+            if [ "$BIOS_RES" = "intermediate" ]; then BIOS_STATUS="⚠️ PARTIAL"; fi
+          fi
+          if [ -f "output/uefi/test-summary.txt" ]; then
+            UEFI_RES=$(grep -E '^RESULT=' output/uefi/test-summary.txt 2>/dev/null | cut -d= -f2)
+            if [ "$UEFI_RES" = "pass" ]; then UEFI_STATUS="✅ PASS"; fi
+            if [ "$UEFI_RES" = "intermediate" ]; then UEFI_STATUS="⚠️ PARTIAL"; fi
+          fi
+          INSTALL_EMOJI="✅"
+          if [ "${{ env.ISO_SAFE }}" = "CAUTION" ]; then INSTALL_EMOJI="⚠️"; fi
+          if [ "${{ env.ISO_SAFE }}" = "NO" ]; then INSTALL_EMOJI="❌"; fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARYEOF
+          ## 🚀 CraftkalOS — Boot Validation Results
+
+          | Step | Status |
+          |------|--------|
+          | 📥 ISO Downloaded | ✅ ${{ env.ISO_NAME }} (${{ env.ISO_SIZE }}) |
+          | 🔄 BIOS Boot (1800s timeout) | ${BIOS_STATUS} |
+          | 🔄 UEFI Boot (1800s timeout) | ${UEFI_STATUS} |
+          | 🛡️ Safe to Install? | ${INSTALL_EMOJI} ${{ env.ISO_SAFE }} |
+          | 📋 Risk | ${{ env.INSTALL_RISK }} |
+          | 📊 Report | BOOT_TEST_REPORT.md in artifact |
+
+          **ISO SHA256:** \`${{ env.ISO_SHA256 }}\`
+          SUMMARYEOF
+
+      - name: Final Status Check
+        if: always()
+        run: |
+          BIOS_RES=$(grep -E '^RESULT=' output/bios/test-summary.txt 2>/dev/null | cut -d= -f2 || echo "missing")
+          UEFI_RES=$(grep -E '^RESULT=' output/uefi/test-summary.txt 2>/dev/null | cut -d= -f2 || echo "missing")
+          echo "BIOS: $BIOS_RES, UEFI: $UEFI_RES"
+          if [ "$BIOS_RES" = "pass" ] || [ "$BIOS_RES" = "intermediate" ] || \
+             [ "$UEFI_RES" = "pass" ] || [ "$UEFI_RES" = "intermediate" ]; then
+            echo "✅ BOOT TEST PASSED — ISO is functional"
+          else
+            echo "❌ BOOT TEST FAILED — ISO may be broken"
+            exit 1
+          fi
