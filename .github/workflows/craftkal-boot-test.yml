@@ -111,12 +111,12 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p output/bios
-          echo "Starting BIOS boot test (timeout: 1800s)..."
+          echo "Starting BIOS boot test (timeout: 3600s, TCG is slow without KVM)..."
           bash .github/scripts/qemu-boot-test.sh \
             --iso "$ISO_FILE" \
             --mode bios \
             --output-dir output/bios \
-            --timeout 1800 2>&1 | tee output/bios/test-summary.txt
+            --timeout 3600 2>&1 | tee output/bios/test-summary.txt
           exit "${PIPESTATUS[0]}"
 
       - name: "Test Progress [2/2] — UEFI Boot Test"
@@ -124,12 +124,12 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p output/uefi
-          echo "Starting UEFI boot test (timeout: 1800s)..."
+          echo "Starting UEFI boot test (timeout: 3600s, TCG is slow without KVM)..."
           bash .github/scripts/qemu-boot-test.sh \
             --iso "$ISO_FILE" \
             --mode uefi \
             --output-dir output/uefi \
-            --timeout 1800 2>&1 | tee output/uefi/test-summary.txt
+            --timeout 3600 2>&1 | tee output/uefi/test-summary.txt
           exit "${PIPESTATUS[0]}"
 
       - name: Generate Boot Test Report
@@ -271,8 +271,8 @@ jobs:
           | Step | Status |
           |------|--------|
           | 📥 ISO Downloaded | ✅ ${{ env.ISO_NAME }} (${{ env.ISO_SIZE }}) |
-          | 🔄 BIOS Boot (1800s timeout) | ${BIOS_STATUS} |
-          | 🔄 UEFI Boot (1800s timeout) | ${UEFI_STATUS} |
+          | 🔄 BIOS Boot (3600s timeout) | ${BIOS_STATUS} |
+          | 🔄 UEFI Boot (3600s timeout) | ${UEFI_STATUS} |
           | 🛡️ Safe to Install? | ${INSTALL_EMOJI} ${{ env.ISO_SAFE }} |
           | 📋 Risk | ${{ env.INSTALL_RISK }} |
           | 📊 Report | BOOT_TEST_REPORT.md in artifact |
